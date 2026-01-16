@@ -187,7 +187,7 @@ def ensure_packages_installed() -> None:
         "pymupdf": "fitz",
         "playwright": "playwright",
         "beautifulsoup4": "bs4",
-        "lxml": "lxml",
+            "lxml": "lxml",
     }
 
     for pkg, mod in probes.items():
@@ -670,6 +670,8 @@ def process_files(file_paths: List[str]) -> List[CertResult]:
                 img = file_to_image(fp_abs)
                 qr_list = []
 
+            
+
             # 4) 兜底：如果角落识别没读到，再对整页/整图跑一次多策略识别
             if not qr_list:
                 qr_list = decode_qr_from_image(img)
@@ -708,6 +710,7 @@ def process_files(file_paths: List[str]) -> List[CertResult]:
             pcid = extract_pcid(qr_url) if qr_url else None
 
             title, fields = scrape_cert_page(qr_url)
+
             # 调试：可选落盘字段（export CERT_TOOL_DEBUG=1 开启）
             if DEBUG_MODE:
                 try:
@@ -726,60 +729,47 @@ def process_files(file_paths: List[str]) -> List[CertResult]:
     return results
 
 
-def export_to_excel(results: List[CertResult], out_xlsx: str) -> None:
-    import pandas as pd
+def _safe_json_path(out_dir: str, base_name: str) -> str:
+    """生成不会覆盖的输出 json 路径。"""
+    base = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff._-]+", "_", base_name).strip("_")
+    if not base:
+        base = "合格证解析结果"
+    path = os.path.join(out_dir, f"{base}.json")
+    if not os.path.exists(path):
+        return path
+    # 若同名已存在，追加时间戳
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    return os.path.join(out_dir, f"{base}_{ts}.json")
 
-    # Sheet1：一证一行（宽表）
-    all_keys = set()
+
+def export_results_to_json(results: List[CertResult]) -> List[str]:
+    """按每个源文件所在目录输出一个 JSON 文件，返回写入的文件路径列表。"""
+    import json
+
+    out_paths: List[str] = []
     for r in results:
-        all_keys.update(r.fields.keys())
-    all_keys = sorted(all_keys)
+        try:
+            src_dir = os.path.dirname(r.source_file) if r.source_file else os.getcwd()
+            base = _derive_cert_no(r.fields) or os.path.splitext(os.path.basename(r.source_file))[0]
+            out_path = _safe_json_path(src_dir, base)
 
-    wide_rows = []
-    for r in results:
-        row = {
-            "source_file": r.source_file,
-            "qr_url": r.qr_url,
-            "pcId": r.pcid,
-            "page_title": r.page_title,
-            "error": r.error or "",
-        }
-        for k in all_keys:
-            row[k] = r.fields.get(k, "")
-        wide_rows.append(row)
-
-    df_wide = pd.DataFrame(wide_rows)
-
-    # Sheet2：长表（更稳）
-    long_rows = []
-    for r in results:
-        if r.fields:
-            for k, v in r.fields.items():
-                long_rows.append({
-                    "source_file": r.source_file,
-                    "qr_url": r.qr_url,
-                    "pcId": r.pcid,
-                    "page_title": r.page_title,
-                    "field": k,
-                    "value": v,
-                    "error": r.error or "",
-                })
-        else:
-            long_rows.append({
+            payload = {
                 "source_file": r.source_file,
                 "qr_url": r.qr_url,
                 "pcId": r.pcid,
                 "page_title": r.page_title,
-                "field": "",
-                "value": "",
+                "fields": r.fields,
                 "error": r.error or "",
-            })
+            }
 
-    df_long = pd.DataFrame(long_rows)
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
 
-    with pd.ExcelWriter(out_xlsx, engine="openpyxl") as writer:
-        df_wide.to_excel(writer, index=False, sheet_name="wide")
-        df_long.to_excel(writer, index=False, sheet_name="long")
+            out_paths.append(out_path)
+        except Exception:
+            pass
+
+    return out_paths
 
 
 # =========================
@@ -867,17 +857,21 @@ def interactive_drag_drop_loop():
             if not r0 or r0.error:
                 err = r0.error if r0 else "未知错误"
                 print(f"❌ 失败：{err}")
-                # 失败也导出一份（便于留痕），用文件名+时间
-                ts = time.strftime("%Y%m%d_%H%M%S")
-                out_xlsx = _safe_excel_path(out_dir, f"失败_{os.path.splitext(os.path.basename(fp))[0]}_{ts}")
-                export_to_excel(results, out_xlsx)
-                print(f"📊 已导出：{os.path.basename(out_xlsx)}")
+                # 失败也导出一份（便于留痕），写入源文件所在目录
+                out_paths = export_results_to_json(results)
+                if out_paths:
+                    for p in out_paths:
+                        print(f"📊 已导出：{os.path.basename(p)}")
+                else:
+                    print("[WARN] 导出失败或无可写入文件。")
                 continue
 
             cert_no = _derive_cert_no(r0.fields) or os.path.splitext(os.path.basename(fp))[0]
-            out_xlsx = _safe_excel_path(out_dir, cert_no)
-            export_to_excel(results, out_xlsx)
-            print(f"✅ 成功！已导出 → {os.path.basename(out_xlsx)}")
+            out_paths = export_results_to_json(results)
+            if out_paths:
+                print(f"✅ 成功！已导出 → {os.path.basename(out_paths[0])}")
+            else:
+                print("[WARN] 导出失败或无可写入文件。")
 
 
 def default_output_path(script_dir: str) -> str:
@@ -898,10 +892,8 @@ def main():
         bad_n = len(results) - ok_n
         print(f"\n📊 处理完成：✅ {ok_n} 成功，❌ {bad_n} 失败")
 
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        out_xlsx = default_output_path(script_dir)
-        export_to_excel(results, out_xlsx)
-        print(f"\n📁 已导出：{os.path.basename(out_xlsx)}")
+        out_paths = export_results_to_json(results)
+        print(f"\n📁 已导出：{len(out_paths)} 个 JSON 文件。")
 
         if bad_n:
             print("\n⚠️  失败文件：")
